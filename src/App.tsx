@@ -1,6 +1,15 @@
-import { useCallback, useEffect, useRef, useState, type ChangeEvent, type MouseEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import { Clipboard, Download, MousePointer2, RefreshCw, Upload } from 'lucide-react';
 
+/** 크롭 영역은 표시 크기와 무관하도록 0~1 비율로 저장한다. */
 type CropRect = {
   x: number;
   y: number;
@@ -8,8 +17,42 @@ type CropRect = {
   height: number;
 };
 
+type HandleId = 'nw' | 'n' | 'ne' | 'w' | 'e' | 'sw' | 's' | 'se';
+
+type Point = { x: number; y: number };
+
+type DragState = {
+  pointerId: number;
+  pointerType: string;
+  mode: 'create' | 'move' | 'resize';
+  handle?: HandleId;
+  origin: Point;
+  startRect: CropRect;
+  previousRect: CropRect | null;
+  moved: boolean;
+};
+
 const MAX_IMAGES = 10;
 const LEFT_COLUMN_COUNT = 5;
+/** 손가락으로 살짝 눌렀을 때 기존 선택이 지워지지 않게 하는 최소 크기(비율). */
+const MIN_CROP_SIZE = 0.01;
+const LOUPE_SIZE = 116;
+const LOUPE_ZOOM = 2.5;
+
+const HANDLES: { id: HandleId; fx: number; fy: number; cursor: string; label: string }[] = [
+  { id: 'nw', fx: 0, fy: 0, cursor: 'nwse-resize', label: '왼쪽 위' },
+  { id: 'n', fx: 0.5, fy: 0, cursor: 'ns-resize', label: '위쪽' },
+  { id: 'ne', fx: 1, fy: 0, cursor: 'nesw-resize', label: '오른쪽 위' },
+  { id: 'w', fx: 0, fy: 0.5, cursor: 'ew-resize', label: '왼쪽' },
+  { id: 'e', fx: 1, fy: 0.5, cursor: 'ew-resize', label: '오른쪽' },
+  { id: 'sw', fx: 0, fy: 1, cursor: 'nesw-resize', label: '왼쪽 아래' },
+  { id: 's', fx: 0.5, fy: 1, cursor: 'ns-resize', label: '아래쪽' },
+  { id: 'se', fx: 1, fy: 1, cursor: 'nwse-resize', label: '오른쪽 아래' },
+];
+
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, value));
+}
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -32,14 +75,17 @@ function loadImage(src: string): Promise<HTMLImageElement> {
 export default function App() {
   const [images, setImages] = useState<string[]>([]);
   const [cropRect, setCropRect] = useState<CropRect | null>(null);
-  const [isDrawing, setIsDrawing] = useState(false);
-  const [startPos, setStartPos] = useState({ x: 0, y: 0 });
   const [resultImage, setResultImage] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [targetReplaceIndex, setTargetReplaceIndex] = useState<number | null>(null);
+  const [displaySize, setDisplaySize] = useState({ width: 0, height: 0 });
+  const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
+  const [loupePoint, setLoupePoint] = useState<Point | null>(null);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const dragRef = useRef<DragState | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
 
   const processFiles = useCallback(
     async (files: File[]) => {
@@ -85,41 +131,192 @@ export default function App() {
     return () => window.removeEventListener('paste', handlePaste);
   }, [processFiles]);
 
-  const handleMouseDown = (event: MouseEvent<HTMLDivElement>) => {
-    if (!containerRef.current) return;
-
-    const rect = containerRef.current.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
-
-    setStartPos({ x, y });
-    setCropRect({ x, y, width: 0, height: 0 });
-    setIsDrawing(true);
-  };
-
-  const handleMouseMove = (event: MouseEvent<HTMLDivElement>) => {
-    if (!isDrawing || !containerRef.current) return;
-
-    const rect = containerRef.current.getBoundingClientRect();
-    const currentX = Math.max(0, Math.min(event.clientX - rect.left, rect.width));
-    const currentY = Math.max(0, Math.min(event.clientY - rect.top, rect.height));
-
-    setCropRect({
-      x: Math.min(startPos.x, currentX),
-      y: Math.min(startPos.y, currentY),
-      width: Math.abs(currentX - startPos.x),
-      height: Math.abs(currentY - startPos.y),
-    });
-  };
-
+  /** 화면 회전이나 창 크기 변경에도 돋보기 배율이 맞도록 표시 크기를 추적한다. */
   useEffect(() => {
-    const handleMouseUp = () => setIsDrawing(false);
-    window.addEventListener('mouseup', handleMouseUp);
-    return () => window.removeEventListener('mouseup', handleMouseUp);
+    const element = containerRef.current;
+    if (!element) return;
+
+    const updateSize = () => {
+      setDisplaySize({ width: element.clientWidth, height: element.clientHeight });
+    };
+
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [images.length]);
+
+  const toNormalizedPoint = useCallback((clientX: number, clientY: number): Point | null => {
+    const element = containerRef.current;
+    if (!element) return null;
+
+    const bounds = element.getBoundingClientRect();
+    if (bounds.width === 0 || bounds.height === 0) return null;
+
+    return {
+      x: clamp01((clientX - bounds.left) / bounds.width),
+      y: clamp01((clientY - bounds.top) / bounds.height),
+    };
   }, []);
 
+  const endDrag = useCallback((cancelled = false) => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    setIsDragging(false);
+    setLoupePoint(null);
+    if (!drag) return;
+
+    /** 취소된 제스처거나 드래그 없이 톡 누르기만 했다면 직전 선택을 되살린다. */
+    if (cancelled || (drag.mode === 'create' && !drag.moved)) {
+      setCropRect(drag.previousRect);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isDragging) return;
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) return;
+
+      const point = toNormalizedPoint(event.clientX, event.clientY);
+      if (!point) return;
+
+      event.preventDefault();
+      setLoupePoint(point);
+
+      if (drag.mode === 'create') {
+        const width = Math.abs(point.x - drag.origin.x);
+        const height = Math.abs(point.y - drag.origin.y);
+        if (width > MIN_CROP_SIZE || height > MIN_CROP_SIZE) {
+          drag.moved = true;
+        }
+
+        setCropRect({
+          x: Math.min(drag.origin.x, point.x),
+          y: Math.min(drag.origin.y, point.y),
+          width,
+          height,
+        });
+        return;
+      }
+
+      if (drag.mode === 'move') {
+        const deltaX = point.x - drag.origin.x;
+        const deltaY = point.y - drag.origin.y;
+
+        setCropRect({
+          ...drag.startRect,
+          x: Math.min(Math.max(drag.startRect.x + deltaX, 0), 1 - drag.startRect.width),
+          y: Math.min(Math.max(drag.startRect.y + deltaY, 0), 1 - drag.startRect.height),
+        });
+        return;
+      }
+
+      const handle = drag.handle ?? 'se';
+      let left = drag.startRect.x;
+      let top = drag.startRect.y;
+      let right = drag.startRect.x + drag.startRect.width;
+      let bottom = drag.startRect.y + drag.startRect.height;
+
+      if (handle.includes('w')) left = point.x;
+      if (handle.includes('e')) right = point.x;
+      if (handle.includes('n')) top = point.y;
+      if (handle.includes('s')) bottom = point.y;
+
+      const width = Math.max(Math.abs(right - left), MIN_CROP_SIZE);
+      const height = Math.max(Math.abs(bottom - top), MIN_CROP_SIZE);
+
+      setCropRect({
+        x: Math.min(Math.min(left, right), 1 - width),
+        y: Math.min(Math.min(top, bottom), 1 - height),
+        width,
+        height,
+      });
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      if (dragRef.current && event.pointerId !== dragRef.current.pointerId) return;
+      endDrag();
+    };
+
+    /** 브라우저가 제스처를 가져간 경우(확대 등)에는 그리던 영역을 되돌린다. */
+    const handlePointerCancel = (event: PointerEvent) => {
+      if (dragRef.current && event.pointerId !== dragRef.current.pointerId) return;
+      endDrag(true);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove, { passive: false });
+    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointercancel', handlePointerCancel);
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerCancel);
+    };
+  }, [endDrag, isDragging, toNormalizedPoint]);
+
+  const beginDrag = (
+    event: ReactPointerEvent<HTMLElement>,
+    mode: DragState['mode'],
+    handle?: HandleId,
+  ) => {
+    /** 두 손가락으로 확대하려는 동작이면 그리던 영역을 되돌리고 브라우저에 넘긴다. */
+    if (dragRef.current) {
+      endDrag(true);
+      return;
+    }
+
+    if (event.button !== 0 && event.pointerType === 'mouse') return;
+
+    const point = toNormalizedPoint(event.clientX, event.clientY);
+    if (!point) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const startRect = cropRect ?? { x: point.x, y: point.y, width: 0, height: 0 };
+
+    dragRef.current = {
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      mode,
+      handle,
+      origin: point,
+      startRect,
+      previousRect: cropRect,
+      moved: false,
+    };
+
+    if (mode === 'create') {
+      setCropRect({ x: point.x, y: point.y, width: 0, height: 0 });
+    }
+
+    setLoupePoint(point);
+    setIsDragging(true);
+  };
+
+  const selectWholeImage = () => {
+    setCropRect({ x: 0, y: 0, width: 1, height: 1 });
+  };
+
+  const clearSelection = () => {
+    setCropRect(null);
+  };
+
+  const hasSelection = Boolean(cropRect && cropRect.width > MIN_CROP_SIZE && cropRect.height > MIN_CROP_SIZE);
+
+  const selectionPixels =
+    cropRect && naturalSize.width > 0
+      ? {
+          width: Math.round(cropRect.width * naturalSize.width),
+          height: Math.round(cropRect.height * naturalSize.height),
+        }
+      : null;
+
   const generateComparison = async () => {
-    if (!cropRect || cropRect.width === 0 || cropRect.height === 0 || !imgRef.current) {
+    if (!cropRect || !hasSelection || !imgRef.current) {
       alert('첫 번째 이미지에서 비교할 범위를 드래그해서 선택해 주세요.');
       return;
     }
@@ -127,13 +324,10 @@ export default function App() {
     setIsProcessing(true);
 
     try {
-      const scaleX = imgRef.current.naturalWidth / imgRef.current.width;
-      const scaleY = imgRef.current.naturalHeight / imgRef.current.height;
-
-      const sourceX = cropRect.x * scaleX;
-      const sourceY = cropRect.y * scaleY;
-      const sourceWidth = cropRect.width * scaleX;
-      const sourceHeight = cropRect.height * scaleY;
+      const sourceX = cropRect.x * imgRef.current.naturalWidth;
+      const sourceY = cropRect.y * imgRef.current.naturalHeight;
+      const sourceWidth = cropRect.width * imgRef.current.naturalWidth;
+      const sourceHeight = cropRect.height * imgRef.current.naturalHeight;
 
       const padding = 16;
       const rowGap = 12;
@@ -208,6 +402,24 @@ export default function App() {
     setResultImage(null);
     setTargetReplaceIndex(null);
   };
+
+  const loupeStyle: CSSProperties | null =
+    loupePoint && images.length > 0 && displaySize.width > 0
+      ? {
+          width: LOUPE_SIZE,
+          height: LOUPE_SIZE,
+          top: loupePoint.y < 0.45 ? undefined : 8,
+          bottom: loupePoint.y < 0.45 ? 8 : undefined,
+          left: loupePoint.x > 0.55 ? 8 : undefined,
+          right: loupePoint.x > 0.55 ? undefined : 8,
+          backgroundImage: `url(${images[0]})`,
+          backgroundRepeat: 'no-repeat',
+          backgroundSize: `${displaySize.width * LOUPE_ZOOM}px ${displaySize.height * LOUPE_ZOOM}px`,
+          backgroundPosition: `${LOUPE_SIZE / 2 - loupePoint.x * displaySize.width * LOUPE_ZOOM}px ${
+            LOUPE_SIZE / 2 - loupePoint.y * displaySize.height * LOUPE_ZOOM
+          }px`,
+        }
+      : null;
 
   return (
     <main className="min-h-screen bg-slate-50 px-4 py-6 text-slate-800 sm:px-6">
@@ -335,14 +547,18 @@ export default function App() {
                   <MousePointer2 className="h-5 w-5 text-blue-500" />
                   <h2 className="text-lg font-semibold">1. 첫 이미지에서 범위 설정</h2>
                 </div>
-                <p className="text-sm text-slate-500">이미지 위를 드래그해서 비교할 영역을 지정하세요.</p>
+                <p className="text-sm text-slate-500">
+                  이미지 위를 손가락이나 마우스로 드래그해 영역을 그리고, 모서리 손잡이를 끌어 크기를, 영역 안쪽을 끌어
+                  위치를 다듬으세요. 두 손가락으로는 화면 확대가 그대로 됩니다.
+                </p>
 
                 <div className="overflow-hidden rounded-xl border border-slate-200 bg-white p-2 shadow-sm">
                   <div
                     ref={containerRef}
                     className="relative inline-block max-w-full cursor-crosshair select-none"
-                    onMouseDown={handleMouseDown}
-                    onMouseMove={handleMouseMove}
+                    style={{ touchAction: 'pinch-zoom', WebkitTouchCallout: 'none' } as CSSProperties}
+                    onPointerDown={(event) => beginDrag(event, 'create')}
+                    onContextMenu={(event) => event.preventDefault()}
                   >
                     <img
                       ref={imgRef}
@@ -350,28 +566,89 @@ export default function App() {
                       alt="첫 번째 이미지"
                       className="block max-w-full rounded"
                       draggable="false"
+                      onLoad={(event) =>
+                        setNaturalSize({
+                          width: event.currentTarget.naturalWidth,
+                          height: event.currentTarget.naturalHeight,
+                        })
+                      }
                     />
 
                     {cropRect && (
+                      <>
+                        <div
+                          className="absolute cursor-move border-2 border-red-500 bg-red-500/20"
+                          style={{
+                            left: `${cropRect.x * 100}%`,
+                            top: `${cropRect.y * 100}%`,
+                            width: `${cropRect.width * 100}%`,
+                            height: `${cropRect.height * 100}%`,
+                          }}
+                          onPointerDown={(event) => beginDrag(event, 'move')}
+                        />
+
+                        {HANDLES.map((handle) => (
+                          <div
+                            key={handle.id}
+                            role="button"
+                            aria-label={`${handle.label} 크기 조절`}
+                            className="absolute flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center"
+                            style={{
+                              left: `${(cropRect.x + cropRect.width * handle.fx) * 100}%`,
+                              top: `${(cropRect.y + cropRect.height * handle.fy) * 100}%`,
+                              cursor: handle.cursor,
+                            }}
+                            onPointerDown={(event) => beginDrag(event, 'resize', handle.id)}
+                          >
+                            <span className="h-4 w-4 rounded-full border-2 border-white bg-red-500 shadow-md" />
+                          </div>
+                        ))}
+                      </>
+                    )}
+
+                    {loupeStyle && (
                       <div
-                        className="pointer-events-none absolute border-2 border-red-500 bg-red-500/20"
-                        style={{
-                          left: `${cropRect.x}px`,
-                          top: `${cropRect.y}px`,
-                          width: `${cropRect.width}px`,
-                          height: `${cropRect.height}px`,
-                        }}
-                      />
+                        className="pointer-events-none absolute z-20 overflow-hidden rounded-full border-2 border-white shadow-xl ring-1 ring-slate-900/30"
+                        style={loupeStyle}
+                      >
+                        <span className="absolute left-1/2 top-0 h-full w-px -translate-x-1/2 bg-red-500/70" />
+                        <span className="absolute left-0 top-1/2 h-px w-full -translate-y-1/2 bg-red-500/70" />
+                      </div>
                     )}
                   </div>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+                  <span>
+                    {selectionPixels && hasSelection
+                      ? `선택 영역: ${selectionPixels.width} × ${selectionPixels.height} px`
+                      : '아직 선택된 영역이 없습니다.'}
+                  </span>
+                  <span className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={selectWholeImage}
+                      className="rounded bg-slate-100 px-2 py-1 font-medium text-slate-700 transition-colors hover:bg-slate-200"
+                    >
+                      전체 선택
+                    </button>
+                    <button
+                      type="button"
+                      onClick={clearSelection}
+                      disabled={!cropRect}
+                      className="rounded bg-slate-100 px-2 py-1 font-medium text-slate-700 transition-colors hover:bg-slate-200 disabled:opacity-50"
+                    >
+                      선택 지우기
+                    </button>
+                  </span>
                 </div>
 
                 <button
                   type="button"
                   onClick={generateComparison}
-                  disabled={isProcessing || !cropRect || cropRect.width === 0}
+                  disabled={isProcessing || !hasSelection}
                   className={`w-full rounded-lg py-3 font-bold text-white transition-all ${
-                    !cropRect || cropRect.width === 0
+                    !hasSelection
                       ? 'cursor-not-allowed bg-slate-400'
                       : 'bg-blue-600 shadow-md hover:bg-blue-700 hover:shadow-lg'
                   }`}
