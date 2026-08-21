@@ -7,7 +7,7 @@ import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
-import { Clipboard, Download, MousePointer2, RefreshCw, Upload } from 'lucide-react';
+import { Clipboard, Download, MousePointer2, RefreshCw, Swords, Upload } from 'lucide-react';
 
 /** 크롭 영역은 표시 크기와 무관하도록 0~1 비율로 저장한다. */
 type CropRect = {
@@ -38,6 +38,18 @@ const LEFT_COLUMN_COUNT = 5;
 const MIN_CROP_SIZE = 0.01;
 const LOUPE_SIZE = 116;
 const LOUPE_ZOOM = 2.5;
+
+const LEFT_ACCENT = '#2563eb';
+const RIGHT_ACCENT = '#dc2626';
+
+/** 결과 이미지만 봐도 어느 쪽이 공격인지 알 수 있도록 열 위에 붙이는 표시. */
+const SIDE_MODES = [
+  { id: 'left-attack', label: '왼쪽 공격', leftLabel: '공격', rightLabel: '수비' },
+  { id: 'right-attack', label: '오른쪽 공격', leftLabel: '수비', rightLabel: '공격' },
+  { id: 'none', label: '표시 안 함', leftLabel: null, rightLabel: null },
+] as const;
+
+type SideModeId = (typeof SIDE_MODES)[number]['id'];
 
 const HANDLES: { id: HandleId; fx: number; fy: number; cursor: string; label: string }[] = [
   { id: 'nw', fx: 0, fy: 0, cursor: 'nwse-resize', label: '왼쪽 위' },
@@ -78,6 +90,7 @@ export default function App() {
   const [resultImage, setResultImage] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [targetReplaceIndex, setTargetReplaceIndex] = useState<number | null>(null);
+  const [sideModeId, setSideModeId] = useState<SideModeId>('left-attack');
   const [displaySize, setDisplaySize] = useState({ width: 0, height: 0 });
   const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
   const [loupePoint, setLoupePoint] = useState<Point | null>(null);
@@ -307,6 +320,8 @@ export default function App() {
 
   const hasSelection = Boolean(cropRect && cropRect.width > MIN_CROP_SIZE && cropRect.height > MIN_CROP_SIZE);
 
+  const sideMode = SIDE_MODES.find((mode) => mode.id === sideModeId) ?? SIDE_MODES[0];
+
   const selectionPixels =
     cropRect && naturalSize.width > 0
       ? {
@@ -333,7 +348,11 @@ export default function App() {
       const rowGap = 12;
       const middleGap = 40;
       const columnWidth = sourceWidth + padding * 2;
-      const columnHeight = sourceHeight * LEFT_COLUMN_COUNT + rowGap * 4 + padding * 2;
+
+      /** 잘라낸 영역 크기가 제각각이라 표시 글자도 열 너비에 맞춰 키운다. */
+      const labelFontSize = Math.round(Math.min(Math.max(columnWidth * 0.09, 20), 56));
+      const headerHeight = sideMode.leftLabel ? Math.round(labelFontSize * 2.4) : 0;
+      const columnHeight = headerHeight + sourceHeight * LEFT_COLUMN_COUNT + rowGap * 4 + padding * 2;
 
       const canvas = document.createElement('canvas');
       canvas.width = columnWidth * 2 + middleGap;
@@ -361,12 +380,43 @@ export default function App() {
       context.lineWidth = 4;
       context.strokeRect(rightColumnX + 2, 2, columnWidth - 4, columnHeight - 4);
 
+      const drawSideLabel = (columnX: number, text: string, accent: string) => {
+        context.font = `bold ${labelFontSize}px sans-serif`;
+        context.textAlign = 'center';
+        context.textBaseline = 'middle';
+
+        const pillHeight = labelFontSize * 1.6;
+        const pillWidth = context.measureText(text).width + labelFontSize * 1.8;
+        const pillX = columnX + (columnWidth - pillWidth) / 2;
+        const pillY = (headerHeight - pillHeight) / 2;
+
+        context.fillStyle = accent;
+        context.beginPath();
+        if (typeof context.roundRect === 'function') {
+          context.roundRect(pillX, pillY, pillWidth, pillHeight, pillHeight / 2);
+        } else {
+          context.rect(pillX, pillY, pillWidth, pillHeight);
+        }
+        context.fill();
+
+        context.fillStyle = '#ffffff';
+        context.fillText(text, columnX + columnWidth / 2, pillY + pillHeight / 2);
+
+        context.textAlign = 'left';
+        context.textBaseline = 'alphabetic';
+      };
+
+      if (sideMode.leftLabel && sideMode.rightLabel) {
+        drawSideLabel(leftColumnX, sideMode.leftLabel, LEFT_ACCENT);
+        drawSideLabel(rightColumnX, sideMode.rightLabel, RIGHT_ACCENT);
+      }
+
       for (let index = 0; index < images.length; index += 1) {
         const image = await loadImage(images[index]);
         const isLeft = index < LEFT_COLUMN_COUNT;
         const rowIndex = isLeft ? index : index - LEFT_COLUMN_COUNT;
         const drawX = isLeft ? leftColumnX + padding : rightColumnX + padding;
-        const drawY = padding + rowIndex * (sourceHeight + rowGap);
+        const drawY = headerHeight + padding + rowIndex * (sourceHeight + rowGap);
 
         context.drawImage(
           image,
@@ -473,7 +523,13 @@ export default function App() {
 
             <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
               <div className="mb-3 flex items-center justify-between gap-3">
-                <h2 className="text-sm font-semibold text-slate-900">이미지 확인 및 교체</h2>
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">이미지 확인 및 교체</h2>
+                  <p className="mt-0.5 text-xs text-slate-500">
+                    1~5번은 왼쪽{sideMode.leftLabel ? `(${sideMode.leftLabel})` : ''}, 6~10번은 오른쪽
+                    {sideMode.rightLabel ? `(${sideMode.rightLabel})` : ''}에 놓입니다.
+                  </p>
+                </div>
                 {targetReplaceIndex !== null && (
                   <button
                     type="button"
@@ -641,6 +697,48 @@ export default function App() {
                       선택 지우기
                     </button>
                   </span>
+                </div>
+
+                <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
+                  <div className="mb-2 flex items-center gap-2">
+                    <Swords className="h-4 w-4 text-slate-500" />
+                    <h3 className="text-sm font-semibold text-slate-900">공격·수비 표시</h3>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2">
+                    {SIDE_MODES.map((mode) => (
+                      <button
+                        key={mode.id}
+                        type="button"
+                        aria-pressed={sideModeId === mode.id}
+                        onClick={() => setSideModeId(mode.id)}
+                        className={`rounded-lg border px-2 py-2 text-xs font-semibold transition-colors ${
+                          sideModeId === mode.id
+                            ? 'border-blue-600 bg-blue-600 text-white'
+                            : 'border-slate-200 bg-white text-slate-600 hover:border-blue-300 hover:text-slate-900'
+                        }`}
+                      >
+                        {mode.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <p className="mt-2 flex items-center gap-1.5 text-xs text-slate-500">
+                    {sideMode.leftLabel && sideMode.rightLabel ? (
+                      <>
+                        결과 이미지 위쪽에
+                        <span className="rounded-full bg-blue-600 px-2 py-0.5 font-bold text-white">
+                          {sideMode.leftLabel}
+                        </span>
+                        <span className="rounded-full bg-red-600 px-2 py-0.5 font-bold text-white">
+                          {sideMode.rightLabel}
+                        </span>
+                        순서로 표시됩니다.
+                      </>
+                    ) : (
+                      '결과 이미지에 공격·수비를 표시하지 않습니다.'
+                    )}
+                  </p>
                 </div>
 
                 <button
